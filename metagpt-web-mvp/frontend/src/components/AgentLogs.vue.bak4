@@ -1,0 +1,426 @@
+<template>
+  <div class="agent-logs">
+    <h2>智能体活动日志</h2>
+    
+    <el-card class="logs-container" shadow="hover">
+      <div class="logs-header">
+        <h3>实时日志</h3>
+        <div class="logs-filters">
+          <el-select v-model="selectedPhase" placeholder="选择阶段" clearable>
+            <el-option
+              v-for="phase in phaseOptions"
+              :key="phase.value"
+              :label="phase.label"
+              :value="phase.value"
+            />
+          </el-select>
+          
+          <el-select v-model="selectedAgent" placeholder="选择智能体" clearable>
+            <el-option
+              v-for="agent in agentOptions"
+              :key="agent.value"
+              :label="agent.label"
+              :value="agent.value"
+            />
+          </el-select>
+          
+          <el-button @click="refreshLogs" :loading="isLoading">
+            刷新
+          </el-button>
+        </div>
+      </div>
+      
+      <div v-if="isLoading" class="loading-container">
+        <el-icon class="loading-icon"><Loading /></el-icon>
+        <span>加载日志中...</span>
+      </div>
+      
+      <div v-else-if="logs.length === 0" class="empty-logs">
+        <el-empty description="暂无智能体活动日志"></el-empty>
+      </div>
+      
+      <div v-else class="logs-content">
+        <div v-for="log in logs" :key="log.id" :class="['log-item', getLogClass(log.message_type)]">
+          <div class="log-header">
+            <span class="agent-name">{{ log.agent_name }}</span>
+            <span class="log-time">{{ formatDate(log.timestamp) }}</span>
+          </div>
+          <div class="log-message">{{ log.message }}</div>
+          <el-tag size="small" :type="getLogTypeTag(log.message_type)" class="log-type-tag">
+            {{ getLogTypeText(log.message_type) }}
+          </el-tag>
+        </div>
+      </div>
+      
+      <div class="logs-pagination">
+        <el-pagination
+          v-if="logs.length > 0"
+          background
+          layout="prev, pager, next"
+          :total="total"
+          :page-size="pageSize"
+          :current-page="currentPage"
+          @current-change="handlePageChange"
+        />
+      </div>
+    </el-card>
+  </div>
+</template>
+
+<script>
+import { ref, computed, onMounted, watch, onBeforeUnmount } from 'vue'
+import { Loading } from '@element-plus/icons-vue'
+import { ElMessage } from 'element-plus'
+import axios from 'axios'
+import io from 'socket.io-client'
+
+export default {
+  name: 'IntelligentAgentLogs',
+  components: {
+    Loading
+  },
+  props: {
+    projectId: {
+      type: String,
+      required: true
+    }
+  },
+  setup(props) {
+    const logs = ref([])
+    const isLoading = ref(false)
+    const selectedPhase = ref('')
+    const selectedAgent = ref('')
+    const currentPage = ref(1)
+    const pageSize = ref(20)
+    const total = ref(0)
+    const agentSet = ref(new Set())
+    let socket = null
+    
+    // 阶段选项
+    const phaseOptions = [
+      { label: '需求分析', value: 'requirement_analysis' },
+      { label: '架构设计', value: 'architecture_design' },
+      { label: '编码实现', value: 'implementation' },
+      { label: '测试验证', value: 'testing' },
+      { label: '部署交付', value: 'deployment' }
+    ]
+    
+    // 智能体选项，动态生成
+    const agentOptions = computed(() => {
+      return Array.from(agentSet.value).map(agent => ({
+        label: agent,
+        value: agent
+      }))
+    })
+    
+    // 加载日志
+    const loadLogs = async () => {
+      try {
+        isLoading.value = true
+        const token = localStorage.getItem('token')
+        if (!token) return
+        
+        // 构建查询参数
+        const params = {
+          offset: (currentPage.value - 1) * pageSize.value,
+          limit: pageSize.value
+        }
+        
+        if (selectedPhase.value) {
+          params.phase_id = selectedPhase.value
+        }
+        
+        if (selectedAgent.value) {
+          params.agent_name = selectedAgent.value
+        }
+        
+        const response = await axios.get(`/api/projects/${props.projectId}/logs`, {
+          headers: { Authorization: `Bearer ${token}` },
+          params
+        })
+        
+        if (response.data) {
+          logs.value = response.data.logs || []
+          total.value = response.data.count || 0
+          
+          // 收集所有代理名称
+          logs.value.forEach(log => {
+            if (log.agent_name) {
+              agentSet.value.add(log.agent_name)
+            }
+          })
+        }
+      } catch (error) {
+        console.error('加载日志失败:', error)
+        ElMessage.error('加载日志失败')
+      } finally {
+        isLoading.value = false
+      }
+    }
+    
+    // 刷新日志
+    const refreshLogs = () => {
+      loadLogs()
+    }
+    
+    // 处理分页变化
+    const handlePageChange = (page) => {
+      currentPage.value = page
+      loadLogs()
+    }
+    
+    // 获取日志类型样式
+    const getLogClass = (type) => {
+      return `log-type-${type || 'log'}`
+    }
+    
+    // 获取日志类型标签
+    const getLogTypeTag = (type) => {
+      const typeMap = {
+        'log': 'info',
+        'error': 'danger',
+        'system': 'warning',
+        'artifact': 'success'
+      }
+      return typeMap[type] || 'info'
+    }
+    
+    // 获取日志类型文本
+    const getLogTypeText = (type) => {
+      const typeMap = {
+        'log': '日志',
+        'error': '错误',
+        'system': '系统',
+        'artifact': '产物'
+      }
+      return typeMap[type] || type
+    }
+    
+    // 格式化日期，显示到毫秒
+    const formatDate = (dateString) => {
+      if (!dateString) return ''
+      const date = new Date(dateString)
+      
+      // 格式化为 YYYY-MM-DD HH:MM:SS.mmm 格式
+      const year = date.getFullYear();
+      const month = String(date.getMonth() + 1).padStart(2, '0');
+      const day = String(date.getDate()).padStart(2, '0');
+      const hours = String(date.getHours()).padStart(2, '0');
+      const minutes = String(date.getMinutes()).padStart(2, '0');
+      const seconds = String(date.getSeconds()).padStart(2, '0');
+      const milliseconds = String(date.getMilliseconds()).padStart(3, '0');
+      
+      return `${year}-${month}-${day} ${hours}:${minutes}:${seconds}.${milliseconds}`;
+    }
+    
+    // 连接WebSocket
+    const connectWebSocket = () => {
+      try {
+        // 直接连接到后端服务的Socket.io
+        const backendUrl = process.env.VUE_APP_API_URL || 'http://localhost:5001'
+        socket = io(backendUrl)
+        
+        socket.on('connect', () => {
+          console.log('WebSocket连接成功')
+          
+          // 加入项目房间
+          socket.emit('join', { project_id: props.projectId })
+        })
+        
+        socket.on('agent_log', (data) => {
+          // 接收到新日志
+          if (data && data.project_id === props.projectId) {
+            // 添加到日志顶部
+            logs.value.unshift({
+              id: data.id || `temp-${Date.now()}`,
+              project_id: data.project_id,
+              phase_id: data.phase_id,
+              agent_name: data.agent_name,
+              message: data.message,
+              message_type: data.message_type,
+              timestamp: data.timestamp
+            })
+            
+            // 限制前端显示的日志数量
+            if (logs.value.length > 100) {
+              logs.value = logs.value.slice(0, 100)
+            }
+            
+            // 收集代理名称
+            if (data.agent_name) {
+              agentSet.value.add(data.agent_name)
+            }
+          }
+        })
+        
+        socket.on('disconnect', () => {
+          console.log('WebSocket连接断开')
+        })
+        
+        socket.on('error', (error) => {
+          console.error('WebSocket错误:', error)
+        })
+      } catch (error) {
+        console.error('WebSocket连接失败:', error)
+      }
+    }
+    
+    // 关闭WebSocket
+    const disconnectWebSocket = () => {
+      if (socket) {
+        socket.disconnect()
+        socket = null
+      }
+    }
+    
+    // 监听项目ID变化
+    watch(() => props.projectId, () => {
+      if (props.projectId) {
+        currentPage.value = 1
+        loadLogs()
+        
+        // 重新连接WebSocket
+        disconnectWebSocket()
+        connectWebSocket()
+      }
+    })
+    
+    // 监听筛选条件变化
+    watch([selectedPhase, selectedAgent], () => {
+      currentPage.value = 1
+      loadLogs()
+    })
+    
+    // 组件挂载时加载数据并连接WebSocket
+    onMounted(() => {
+      if (props.projectId) {
+        loadLogs()
+        connectWebSocket()
+      }
+    })
+    
+    // 组件卸载时断开WebSocket
+    onBeforeUnmount(() => {
+      disconnectWebSocket()
+    })
+    
+    return {
+      logs,
+      isLoading,
+      selectedPhase,
+      selectedAgent,
+      currentPage,
+      pageSize,
+      total,
+      phaseOptions,
+      agentOptions,
+      refreshLogs,
+      handlePageChange,
+      getLogClass,
+      getLogTypeTag,
+      getLogTypeText,
+      formatDate
+    }
+  }
+}
+</script>
+
+<style scoped>
+.agent-logs {
+  margin: 20px 0;
+}
+
+.logs-container {
+  margin: 20px 0;
+}
+
+.logs-header {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  margin-bottom: 20px;
+}
+
+.logs-filters {
+  display: flex;
+  gap: 10px;
+}
+
+.loading-container {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 100px;
+  color: #909399;
+}
+
+.loading-icon {
+  margin-right: 10px;
+  font-size: 20px;
+}
+
+.empty-logs {
+  margin: 30px 0;
+}
+
+.logs-content {
+  max-height: 600px;
+  overflow-y: auto;
+}
+
+.log-item {
+  margin-bottom: 15px;
+  padding: 10px 15px;
+  border-radius: 4px;
+  border-left: 4px solid #909399;
+  background-color: #f5f7fa;
+  position: relative;
+}
+
+.log-item.log-type-error {
+  border-left-color: #f56c6c;
+  background-color: #fef0f0;
+}
+
+.log-item.log-type-system {
+  border-left-color: #e6a23c;
+  background-color: #fdf6ec;
+}
+
+.log-item.log-type-artifact {
+  border-left-color: #67c23a;
+  background-color: #f0f9eb;
+}
+
+.log-header {
+  display: flex;
+  justify-content: space-between;
+  margin-bottom: 5px;
+}
+
+.agent-name {
+  font-weight: bold;
+}
+
+.log-time {
+  font-size: 12px;
+  color: #909399;
+}
+
+.log-message {
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.log-type-tag {
+  position: absolute;
+  top: 10px;
+  right: 15px;
+}
+
+.logs-pagination {
+  margin-top: 20px;
+  display: flex;
+  justify-content: center;
+}
+</style> 

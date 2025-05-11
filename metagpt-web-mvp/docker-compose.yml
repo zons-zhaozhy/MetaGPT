@@ -1,0 +1,28 @@
+version: '3'
+
+services:
+  backend:
+    build: ./backend
+    container_name: metagpt-web-backend
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./data:/app/data
+    environment:
+      - FLASK_APP=app.py
+      - FLASK_ENV=production
+      - JWT_SECRET_KEY=change-this-in-production
+      - ADMIN_PASSWORD=admin123
+      - DATA_DIR=/app/data
+    restart: unless-stopped
+
+  frontend:
+    build: ./frontend
+    container_name: metagpt-web-frontend
+    ports:
+      - "80:80"
+    depends_on:
+      - backend
+    environment:
+      - VUE_APP_API_URL=http://localhost:5000
+    restart: unless-stopped 
