@@ -15,5 +15,6 @@ module.exports = {
         logLevel: 'debug'
       }
     }
-  }
+  },
+  lintOnSave: false
 } 
