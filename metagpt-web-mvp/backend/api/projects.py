@@ -10,6 +10,13 @@ import shutil
 import json
 import sqlite3
 from flask_socketio import emit
+import socket
+import re
+import traceback
+from werkzeug.utils import secure_filename
+import pdfplumber
+from docx import Document
+import openai
 
 projects_bp = Blueprint('projects', __name__, url_prefix='/api/projects')
 
@@ -1174,11 +1181,186 @@ def get_next_phase(phase):
     
     return None
 
-# 需求澄清相关API
+# 添加文档处理类
+class RequirementDocumentParser:
+    """解析各种文档格式为纯文本需求"""
+    
+    @staticmethod
+    def parse_document(file_path):
+        """根据文件类型解析文档内容"""
+        file_extension = os.path.splitext(file_path)[1].lower()
+        
+        if file_extension == '.pdf':
+            return RequirementDocumentParser._parse_pdf(file_path)
+        elif file_extension == '.docx':
+            return RequirementDocumentParser._parse_docx(file_path)
+        elif file_extension in ['.txt', '.md']:
+            return RequirementDocumentParser._parse_text(file_path)
+        else:
+            raise ValueError(f"不支持的文件格式: {file_extension}")
+    
+    @staticmethod
+    def _parse_pdf(file_path):
+        """解析PDF文档"""
+        text = ""
+        try:
+            with pdfplumber.open(file_path) as pdf:
+                for page in pdf.pages:
+                    extracted = page.extract_text() or ""
+                    text += extracted + "\n"
+            return text
+        except Exception as e:
+            print(f"PDF解析错误: {e}")
+            raise
+    
+    @staticmethod
+    def _parse_docx(file_path):
+        """解析Word文档"""
+        try:
+            doc = Document(file_path)
+            return "\n".join(para.text for para in doc.paragraphs)
+        except Exception as e:
+            print(f"Word文档解析错误: {e}")
+            raise
+    
+    @staticmethod
+    def _parse_text(file_path):
+        """解析纯文本文件"""
+        try:
+            with open(file_path, 'r', encoding='utf-8') as f:
+                return f.read()
+        except UnicodeDecodeError:
+            # 尝试不同编码
+            with open(file_path, 'r', encoding='latin-1') as f:
+                return f.read()
+        except Exception as e:
+            print(f"文本文件解析错误: {e}")
+            raise
+
+class RequirementAnalyzer:
+    """分析需求文本，评估清晰度并生成澄清问题"""
+    
+    def __init__(self, openai_api_key=None):
+        # 优先使用传入的API密钥，其次使用环境变量
+        self.api_key = openai_api_key or os.getenv("OPENAI_API_KEY")
+        
+    def analyze_clarity(self, requirement_text):
+        """
+        分析需求清晰度，返回评分和模糊点
+        """
+        try:
+            if not self.api_key:
+                # 如果没有API密钥，使用简单的规则分析
+                return self._rule_based_analysis(requirement_text)
+                
+            # 使用OpenAI进行分析
+            client = openai.OpenAI(api_key=self.api_key)
+            
+            prompt = """
+            作为需求分析专家，请评估以下软件需求的清晰度，识别模糊点并生成澄清问题。
+            
+            清晰度评估标准:
+            1. 功能需求是否明确具体
+            2. 非功能需求是否完整(性能、安全、可靠性等)
+            3. 术语是否有歧义
+            4. 用户场景是否完整
+            5. 约束条件是否明确
+            
+            以JSON格式返回，包含以下字段:
+            {
+              "clarity_score": 0.0-1.0, // 清晰度评分，1.0代表完全清晰
+              "ambiguous_points": [
+                {
+                  "type": "功能模糊|术语歧义|需求缺失|约束不明|场景不全",
+                  "description": "具体描述模糊点",
+                  "position": "需求中的相关文本",
+                  "clarification_question": "针对性的澄清问题"
+                }
+              ],
+              "needs_clarification": true或false // 是否需要进行需求澄清
+            }
+            
+            需求文本:
+            """
+            
+            response = client.chat.completions.create(
+                model="gpt-3.5-turbo-0125",
+                messages=[
+                    {"role": "system", "content": "你是一个专业的需求分析专家，擅长评估软件需求的清晰度并识别需要澄清的地方。"},
+                    {"role": "user", "content": prompt + requirement_text}
+                ],
+                response_format={"type": "json_object"}
+            )
+            
+            analysis = json.loads(response.choices[0].message.content)
+            return analysis
+            
+        except Exception as e:
+            print(f"需求分析错误: {e}")
+            # 出错时使用规则分析作为后备
+            return self._rule_based_analysis(requirement_text)
+    
+    def _rule_based_analysis(self, text):
+        """基于简单规则的分析，作为AI分析的后备方案"""
+        # 计算字数，太少的需求通常不够详细
+        words = len(text.split())
+        
+        # 模糊词汇检测
+        ambiguous_terms = ["优化", "提高", "改进", "增强", "友好", "美观", "合理", "适当", "考虑", "灵活"]
+        found_terms = [term for term in ambiguous_terms if term in text]
+        
+        # 计算模糊度
+        ambiguity = min(1.0, len(found_terms) * 0.1 + (1.0 if words < 100 else 0))
+        clarity_score = 1.0 - ambiguity
+        
+        # 构建模糊点列表
+        ambiguous_points = []
+        for term in found_terms:
+            # 找出包含模糊词的句子
+            sentences = [s for s in text.split('。') if term in s]
+            for sentence in sentences:
+                ambiguous_points.append({
+                    "type": "功能模糊" if term in ["优化", "提高", "改进", "增强"] else "术语歧义",
+                    "description": f"'{term}'是模糊表述，需要具体化",
+                    "position": sentence,
+                    "clarification_question": f"请具体说明'{sentence}'中的'{term}'具体指什么？需要什么具体的标准或功能？"
+                })
+        
+        # 添加字数不足的提示
+        if words < 100:
+            ambiguous_points.append({
+                "type": "需求缺失",
+                "description": "需求描述过于简短，缺少详细信息",
+                "position": text,
+                "clarification_question": "请提供更多关于系统功能、用户场景和约束条件的详细信息。"
+            })
+        
+        return {
+            "clarity_score": clarity_score,
+            "ambiguous_points": ambiguous_points,
+            "needs_clarification": clarity_score < 0.7 or len(ambiguous_points) > 0
+        }
+    
+    def generate_questions(self, analysis):
+        """根据分析结果生成澄清问题"""
+        if not analysis.get("needs_clarification", True):
+            return []
+            
+        # 直接从分析中提取问题
+        questions = []
+        for point in analysis.get("ambiguous_points", []):
+            questions.append(point.get("clarification_question"))
+            
+        # 确保至少有一个问题
+        if not questions:
+            questions.append("请提供更多关于系统需求的具体细节，特别是功能需求和约束条件。")
+            
+        return questions
+
 @projects_bp.route('/<project_id>/clarify', methods=['GET'])
 @jwt_required()
 def generate_clarification_questions(project_id):
-    """生成澄清问题"""
+    """智能生成澄清问题"""
     try:
         conn = current_app.db
         
@@ -1192,7 +1374,11 @@ def generate_clarification_questions(project_id):
             return jsonify({"error": "Project not found"}), 404
         
         # 获取项目需求
-        requirement = project[2]
+        requirement = project[2] or ""
+        
+        # 检查需求是否为空
+        if not requirement.strip():
+            return jsonify({"error": "项目需求为空，请先输入需求或上传需求文档"}), 400
         
         # 检查是否已经有问题，避免重复生成
         existing_questions = conn.execute(
@@ -1203,19 +1389,36 @@ def generate_clarification_questions(project_id):
         # 如果已经有问题，直接返回它们
         if existing_questions > 0:
             questions = conn.execute(
-                "SELECT id, question, priority, status, created_at FROM clarification_questions WHERE project_id = ? ORDER BY priority",
+                "SELECT id, question, priority, status, created_at, needs_followup FROM clarification_questions WHERE project_id = ? ORDER BY priority",
                 (project_id,)
             ).fetchall()
             
-            result = [
-                {
+            result = []
+            for q in questions:
+                question_data = {
                     "id": q[0],
                     "question": q[1],
                     "priority": q[2],
                     "status": q[3],
-                    "created_at": q[4]
-                } for q in questions
-            ]
+                    "created_at": q[4],
+                    "needs_followup": bool(q[5]) if len(q) > 5 else False
+                }
+                
+                # 获取问题的回答
+                answers = conn.execute(
+                    "SELECT id, answer, created_at FROM clarification_answers WHERE question_id = ? ORDER BY created_at",
+                    (q[0],)
+                ).fetchall()
+                
+                question_data["answers"] = [
+                    {
+                        "id": a[0],
+                        "answer": a[1],
+                        "created_at": a[2]
+                    } for a in answers
+                ]
+                
+                result.append(question_data)
             
             return jsonify({
                 "project_id": project_id,
@@ -1223,20 +1426,16 @@ def generate_clarification_questions(project_id):
                 "from_cache": True
             })
         
-        # 生成新问题
-        # TODO: 使用LLM生成澄清问题
-        # 这里简单模拟几个问题
-        questions = [
-            "您能具体描述一下项目的目标用户群体吗？",
-            "系统需要支持哪些主要功能？",
-            "您对系统的性能有什么特殊要求？",
-            "是否需要考虑特定的安全性需求？"
-        ]
+        # 使用需求分析器生成新问题
+        analyzer = RequirementAnalyzer(current_app.config.get('OPENAI_API_KEY'))
+        analysis = analyzer.analyze_clarity(requirement)
+        questions = analyzer.generate_questions(analysis)
+        
+        # 保存分析结果
+        current_time = datetime.now().isoformat()
         
         # 保存问题到数据库
         result = []
-        current_time = datetime.now().isoformat()
-        
         for i, question in enumerate(questions):
             question_id = str(uuid.uuid4())
             conn.execute(
@@ -1253,120 +1452,40 @@ def generate_clarification_questions(project_id):
                 "question": question,
                 "priority": i,
                 "status": "pending",
-                "created_at": current_time
+                "created_at": current_time,
+                "answers": []
             })
         
         conn.commit()
         
+        # 记录需求分析活动
+        log_agent_activity(
+            project_id=project_id,
+            phase_id="requirement_analysis",
+            agent_name="需求分析器",
+            message=f"需求清晰度分析完成，得分: {analysis.get('clarity_score', 0.5):.2f}，生成 {len(questions)} 个澄清问题",
+            message_type="analysis"
+        )
+        
         return jsonify({
             "project_id": project_id,
             "questions": result,
+            "clarity_score": analysis.get("clarity_score", 0.5),
             "from_cache": False
         })
         
     except Exception as e:
         print(f"Error generating clarification questions: {e}")
-        # 更详细的错误记录
-        import traceback
-        error_details = traceback.format_exc()
-        print(f"Detailed error: {error_details}")
+        traceback.print_exc()
         return jsonify({"error": str(e)}), 500
 
-@projects_bp.route('/<project_id>/clarify/answer', methods=['POST'])
+@projects_bp.route('/<project_id>/upload-requirement', methods=['POST'])
 @jwt_required()
-def submit_clarification_answers(project_id):
-    """提交澄清问题的回答"""
+def upload_requirement_document(project_id):
+    """上传并解析需求文档"""
     try:
-        data = request.json
-        if not data:
-            return jsonify({"error": "Missing request body"}), 400
-        
-        question_id = data.get('question_id')
-        answer = data.get('answer')
-        
-        if not question_id or not answer:
-            return jsonify({"error": "Missing required fields"}), 400
-        
-        conn = current_app.db
-        
-        # 检查问题是否存在
-        question = conn.execute(
-            "SELECT * FROM clarification_questions WHERE id = ? AND project_id = ?",
-            (question_id, project_id)
-        ).fetchone()
-        
-        if not question:
-            return jsonify({"error": "Question not found"}), 404
-        
-        # 保存回答
-        answer_id = str(uuid.uuid4())
-        current_time = datetime.now().isoformat()
-        
-        conn.execute(
-            """
-            INSERT INTO clarification_answers 
-            (id, question_id, project_id, answer, created_at) 
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (answer_id, question_id, project_id, answer, current_time)
-        )
-        
-        # 更新问题状态
-        conn.execute(
-            "UPDATE clarification_questions SET status = 'answered' WHERE id = ?",
-            (question_id,)
-        )
-        
-        # 更新项目需求
-        # 获取现有需求
-        project = conn.execute(
-            "SELECT requirement FROM projects WHERE id = ?",
-            (project_id,)
-        ).fetchone()
-        
-        existing_requirement = project[0] if project else ""
-        
-        # 拼接问题和回答到需求中
-        updated_requirement = f"{existing_requirement}\n\n问题：{question[2]}\n回答：{answer}"
-        
-        conn.execute(
-            "UPDATE projects SET requirement = ? WHERE id = ?",
-            (updated_requirement, project_id)
-        )
-        
-        conn.commit()
-        
-        # 判断是否需要生成后续问题（模拟）
-        needs_followup = False
-        if "更多" in answer or "详细" in answer or len(answer) > 100:
-            needs_followup = True
-            
-            # 更新问题需要后续跟进
-            conn.execute(
-                "UPDATE clarification_questions SET needs_followup = 1 WHERE id = ?",
-                (question_id,)
-            )
-            conn.commit()
-        
-        return jsonify({
-            "success": True,
-            "answer_id": answer_id,
-            "needs_followup": needs_followup
-        })
-        
-    except Exception as e:
-        return jsonify({"error": str(e)}), 500
-
-# 获取项目澄清问题列表
-@projects_bp.route('/<project_id>/clarify/questions', methods=['GET'])
-@jwt_required()
-def get_clarification_questions(project_id):
-    """获取项目的澄清问题列表"""
-    try:
-        # 使用应用的数据库连接而不是创建新连接
-        conn = current_app.db
-        
         # 检查项目是否存在
+        conn = current_app.db
         project = conn.execute(
             "SELECT * FROM projects WHERE id = ?", 
             (project_id,)
@@ -1375,59 +1494,93 @@ def get_clarification_questions(project_id):
         if not project:
             return jsonify({"error": "Project not found"}), 404
         
-        # 获取所有问题
-        questions = conn.execute(
-            "SELECT * FROM clarification_questions WHERE project_id = ? ORDER BY priority",
-            (project_id,)
-        ).fetchall()
-        
-        # 获取所有回答
-        answers = conn.execute(
-            "SELECT * FROM clarification_answers WHERE project_id = ?",
-            (project_id,)
-        ).fetchall()
-        
-        # 构建问题-回答映射
-        answers_map = {}
-        for answer in answers:
-            q_id = answer[1]  # question_id
-            if q_id not in answers_map:
-                answers_map[q_id] = []
+        # 检查是否有文件上传
+        if 'file' not in request.files:
+            return jsonify({"error": "No file part"}), 400
             
-            answers_map[q_id].append({
-                "id": answer[0],
-                "answer": answer[3],
-                "created_at": answer[4]
-            })
+        file = request.files['file']
+        if file.filename == '':
+            return jsonify({"error": "No selected file"}), 400
+            
+        # 检查文件扩展名
+        allowed_extensions = {'.pdf', '.docx', '.txt', '.md'}
+        file_ext = os.path.splitext(file.filename)[1].lower()
         
-        # 构建结果
-        result = []
-        for q in questions:
-            result.append({
-                "id": q[0],
-                "question": q[2],
-                "created_at": q[3],
-                "status": q[4],
-                "priority": q[5],
-                "needs_followup": bool(q[6]) if len(q) > 6 else False,
-                "answers": answers_map.get(q[0], [])
-            })
+        if file_ext not in allowed_extensions:
+            return jsonify({"error": f"文件类型不支持，仅支持: {', '.join(allowed_extensions)}"}), 400
         
-        # 如果没有问题，返回空列表
-        if not questions:
-            return jsonify({
-                "project_id": project_id,
-                "questions": []
-            })
+        # 创建项目文件目录（如果不存在）
+        project_dir = os.path.join(current_app.config['DATA_DIR'], project_id)
+        os.makedirs(project_dir, exist_ok=True)
         
+        # 保存上传的文件
+        secure_name = secure_filename(file.filename)
+        file_path = os.path.join(project_dir, secure_name)
+        file.save(file_path)
+        
+        # 解析文档
+        try:
+            parsed_text = RequirementDocumentParser.parse_document(file_path)
+        except Exception as e:
+            return jsonify({"error": f"文档解析失败: {str(e)}"}), 500
+        
+        # 分析需求清晰度
+        analyzer = RequirementAnalyzer(current_app.config.get('OPENAI_API_KEY'))
+        analysis = analyzer.analyze_clarity(parsed_text)
+        
+        # 保存解析结果到数据库
+        existing_req = project[2] or ""
+        # 合并上传文档内容与现有需求
+        updated_requirement = f"{existing_req}\n\n--- 从上传文档解析的需求 ---\n\n{parsed_text}" if existing_req else parsed_text
+        
+        conn.execute(
+            "UPDATE projects SET requirement = ? WHERE id = ?",
+            (updated_requirement, project_id)
+        )
+        
+        # 添加上传的文件记录
+        file_id = str(uuid.uuid4())
+        current_time = datetime.now().isoformat()
+        conn.execute(
+            """
+            INSERT INTO project_files 
+            (id, project_id, filename, file_path, file_type, created_at) 
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (file_id, project_id, secure_name, file_path, file_ext[1:], current_time)
+        )
+        conn.commit()
+        
+        # 如果需要澄清，生成澄清问题
+        if analysis.get("needs_clarification", True):
+            questions = analyzer.generate_questions(analysis)
+            
+            # 保存问题到数据库
+            for i, question in enumerate(questions):
+                question_id = str(uuid.uuid4())
+                conn.execute(
+                    """
+                    INSERT INTO clarification_questions 
+                    (id, project_id, question, created_at, status, priority) 
+                    VALUES (?, ?, ?, ?, 'pending', ?)
+                    """,
+                    (question_id, project_id, question, current_time, i)
+                )
+            conn.commit()
+            
         return jsonify({
-            "project_id": project_id,
-            "questions": result
+            "success": True,
+            "extracted_text": parsed_text[:500] + "..." if len(parsed_text) > 500 else parsed_text,
+            "clarity_score": analysis.get("clarity_score", 0.5),
+            "needs_clarification": analysis.get("needs_clarification", True),
+            "ambiguous_points": analysis.get("ambiguous_points", []),
+            "file_id": file_id
         })
-            
+        
     except Exception as e:
-        print(f"Error getting clarification questions: {e}")
-        return jsonify({"error": f"Failed to fetch clarification questions: {str(e)}"}), 500
+        print(f"Error uploading requirement document: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
 
 # 新增函数：带有应用上下文的阶段执行
 def run_phase_with_app_context(app, db_path, project_id, phase, state_file, requirement):
@@ -2043,3 +2196,178 @@ def get_phase_step(phase):
         "testing": 5
     }
     return phase_steps.get(phase, 0) 
+
+@projects_bp.route('/<project_id>/clarify/answer', methods=['POST'])
+@jwt_required()
+def submit_clarification_answers(project_id):
+    """提交澄清问题的回答"""
+    try:
+        data = request.json
+        if not data:
+            return jsonify({"error": "Missing request body"}), 400
+        
+        question_id = data.get('question_id')
+        answer = data.get('answer')
+        
+        if not question_id or not answer:
+            return jsonify({"error": "Missing required fields"}), 400
+        
+        conn = current_app.db
+        
+        # 检查问题是否存在
+        question = conn.execute(
+            "SELECT * FROM clarification_questions WHERE id = ? AND project_id = ?",
+            (question_id, project_id)
+        ).fetchone()
+        
+        if not question:
+            return jsonify({"error": "Question not found"}), 404
+        
+        # 保存回答
+        answer_id = str(uuid.uuid4())
+        current_time = datetime.now().isoformat()
+        
+        conn.execute(
+            """
+            INSERT INTO clarification_answers 
+            (id, question_id, project_id, answer, created_at) 
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (answer_id, question_id, project_id, answer, current_time)
+        )
+        
+        # 更新问题状态
+        conn.execute(
+            "UPDATE clarification_questions SET status = 'answered' WHERE id = ?",
+            (question_id,)
+        )
+        
+        # 更新项目需求
+        # 获取现有需求
+        project = conn.execute(
+            "SELECT requirement FROM projects WHERE id = ?",
+            (project_id,)
+        ).fetchone()
+        
+        existing_requirement = project[0] if project else ""
+        
+        # 获取问题内容
+        question_text = question[2]
+        
+        # 拼接问题和回答到需求中
+        updated_requirement = f"{existing_requirement}\n\n问题：{question_text}\n回答：{answer}"
+        
+        conn.execute(
+            "UPDATE projects SET requirement = ? WHERE id = ?",
+            (updated_requirement, project_id)
+        )
+        
+        conn.commit()
+        
+        # 使用RequirementAnalyzer判断是否需要生成后续问题
+        analyzer = RequirementAnalyzer(current_app.config.get('OPENAI_API_KEY'))
+        needs_followup = False
+        
+        # 分析回答中是否存在模糊性或需要进一步澄清
+        followup_analysis = analyzer._rule_based_analysis(answer)
+        if followup_analysis.get("needs_clarification", False):
+            needs_followup = True
+            
+            # 更新问题需要后续跟进
+            conn.execute(
+                "UPDATE clarification_questions SET needs_followup = 1 WHERE id = ?",
+                (question_id,)
+            )
+            conn.commit()
+        
+        # 记录回答活动
+        log_agent_activity(
+            project_id=project_id,
+            phase_id="requirement_analysis",
+            agent_name="用户",
+            message=f"回答了问题 \"{question_text[:30]}...\"",
+            message_type="answer"
+        )
+        
+        return jsonify({
+            "success": True,
+            "answer_id": answer_id,
+            "needs_followup": needs_followup
+        })
+        
+    except Exception as e:
+        print(f"Error submitting answer: {e}")
+        traceback.print_exc()
+        return jsonify({"error": str(e)}), 500
+
+# 获取项目澄清问题列表
+@projects_bp.route('/<project_id>/clarify/questions', methods=['GET'])
+@jwt_required()
+def get_clarification_questions(project_id):
+    """获取项目的澄清问题列表"""
+    try:
+        # 使用应用的数据库连接而不是创建新连接
+        conn = current_app.db
+        
+        # 检查项目是否存在
+        project = conn.execute(
+            "SELECT * FROM projects WHERE id = ?", 
+            (project_id,)
+        ).fetchone()
+        
+        if not project:
+            return jsonify({"error": "Project not found"}), 404
+        
+        # 获取所有问题
+        questions = conn.execute(
+            "SELECT * FROM clarification_questions WHERE project_id = ? ORDER BY priority",
+            (project_id,)
+        ).fetchall()
+        
+        # 获取所有回答
+        answers = conn.execute(
+            "SELECT * FROM clarification_answers WHERE project_id = ?",
+            (project_id,)
+        ).fetchall()
+        
+        # 构建问题-回答映射
+        answers_map = {}
+        for answer in answers:
+            q_id = answer[1]  # question_id
+            if q_id not in answers_map:
+                answers_map[q_id] = []
+            
+            answers_map[q_id].append({
+                "id": answer[0],
+                "answer": answer[3],
+                "created_at": answer[4]
+            })
+        
+        # 构建结果
+        result = []
+        for q in questions:
+            result.append({
+                "id": q[0],
+                "question": q[2],
+                "created_at": q[3],
+                "status": q[4],
+                "priority": q[5],
+                "needs_followup": bool(q[6]) if len(q) > 6 else False,
+                "answers": answers_map.get(q[0], [])
+            })
+        
+        # 如果没有问题，返回空列表
+        if not questions:
+            return jsonify({
+                "project_id": project_id,
+                "questions": []
+            })
+        
+        return jsonify({
+            "project_id": project_id,
+            "questions": result
+        })
+            
+    except Exception as e:
+        print(f"Error getting clarification questions: {e}")
+        return jsonify({"error": f"Failed to fetch clarification questions: {str(e)}"}), 500

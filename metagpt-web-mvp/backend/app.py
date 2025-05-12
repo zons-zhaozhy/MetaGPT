@@ -9,6 +9,8 @@ import threading
 
 from api.auth import auth_bp
 from api.projects import projects_bp
+from api.requirement_clarifier import clarify_bp
+from migrate_db import migrate_database
 
 # 加载环境变量
 load_dotenv()
@@ -16,6 +18,7 @@ load_dotenv()
 app = Flask(__name__, static_folder="../frontend/dist", static_url_path="/")
 app.config["JWT_SECRET_KEY"] = os.environ.get("JWT_SECRET_KEY", "dev-secret-key")
 app.config["DATA_DIR"] = os.environ.get("DATA_DIR", os.path.join(os.getcwd(), "data"))
+app.config["OPENAI_API_KEY"] = os.environ.get("OPENAI_API_KEY", "")
 
 # 确保数据目录存在
 os.makedirs(app.config["DATA_DIR"], exist_ok=True)
@@ -38,126 +41,13 @@ register_socketio_handlers(socketio)
 # 初始化数据库
 def init_db():
     db_path = os.path.join(app.config["DATA_DIR"], "metagpt_web.db")
+    
+    # 使用迁移脚本更新数据库结构
+    migrate_database(db_path)
+    
+    # 连接到数据库
     conn = sqlite3.connect(db_path, check_same_thread=False)
     
-    # 创建项目表
-    conn.execute('''
-    CREATE TABLE IF NOT EXISTS projects (
-        id TEXT PRIMARY KEY,
-        name TEXT NOT NULL,
-        requirement TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        status TEXT NOT NULL,
-        active_step INTEGER DEFAULT 0,
-        current_phase TEXT DEFAULT 'pending',
-        phases_completed TEXT DEFAULT '[]'
-    )
-    ''')
-    
-    # 创建项目文件表
-    conn.execute('''
-    CREATE TABLE IF NOT EXISTS project_files (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        filename TEXT NOT NULL,
-        file_path TEXT NOT NULL,
-        file_type TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        FOREIGN KEY (project_id) REFERENCES projects (id)
-    )
-    ''')
-    
-    # 创建项目阶段表 - 增强支持状态持久化
-    conn.execute('''
-    CREATE TABLE IF NOT EXISTS project_phases (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        phase_id TEXT NOT NULL,
-        status TEXT DEFAULT 'pending',
-        started_at TEXT,
-        completed_at TEXT,
-        artifacts TEXT DEFAULT '{}',
-        feedback TEXT DEFAULT '{}',
-        can_retry BOOLEAN DEFAULT 1,
-        retry_count INTEGER DEFAULT 0,
-        metadata TEXT DEFAULT '{}',
-        FOREIGN KEY (project_id) REFERENCES projects (id)
-    )
-    ''')
-    
-    # 新增: 创建澄清问题表
-    conn.execute('''
-    CREATE TABLE IF NOT EXISTS clarification_questions (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        question TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        status TEXT DEFAULT 'pending',
-        priority INTEGER DEFAULT 0,
-        needs_followup BOOLEAN DEFAULT 0,
-        FOREIGN KEY (project_id) REFERENCES projects (id)
-    )
-    ''')
-    
-    # 新增: 创建澄清问题回答表
-    conn.execute('''
-    CREATE TABLE IF NOT EXISTS clarification_answers (
-        id TEXT PRIMARY KEY,
-        question_id TEXT NOT NULL,
-        project_id TEXT NOT NULL,
-        answer TEXT NOT NULL,
-        created_at TEXT NOT NULL,
-        FOREIGN KEY (question_id) REFERENCES clarification_questions (id),
-        FOREIGN KEY (project_id) REFERENCES projects (id)
-    )
-    ''')
-    
-    # 新增: 创建代理活动日志表
-    conn.execute('''
-    CREATE TABLE IF NOT EXISTS agent_logs (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        phase_id TEXT NOT NULL,
-        agent_name TEXT NOT NULL,
-        message TEXT NOT NULL,
-        message_type TEXT DEFAULT 'log',
-        timestamp TEXT NOT NULL,
-        FOREIGN KEY (project_id) REFERENCES projects (id),
-        FOREIGN KEY (phase_id) REFERENCES project_phases (id)
-    )
-    ''')
-    
-    # 新增: 创建智能体活动日志表
-    conn.execute('''
-    CREATE TABLE IF NOT EXISTS agent_logs (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        phase_id TEXT NOT NULL,
-        agent_name TEXT NOT NULL,
-        message TEXT NOT NULL,
-        message_type TEXT DEFAULT 'log',
-        timestamp TEXT NOT NULL,
-        FOREIGN KEY (project_id) REFERENCES projects (id),
-        FOREIGN KEY (phase_id) REFERENCES project_phases (id)
-    )
-    ''')
-    
-    # 新增: 创建智能体活动日志表
-    conn.execute('''
-    CREATE TABLE IF NOT EXISTS agent_logs (
-        id TEXT PRIMARY KEY,
-        project_id TEXT NOT NULL,
-        phase_id TEXT NOT NULL,
-        agent_name TEXT NOT NULL,
-        message TEXT NOT NULL,
-        message_type TEXT DEFAULT 'log',
-        timestamp TEXT NOT NULL,
-        FOREIGN KEY (project_id) REFERENCES projects (id),
-        FOREIGN KEY (phase_id) REFERENCES project_phases (id)
-    )
-    ''')
-    
-    conn.commit()
     return conn
 
 # 在请求前初始化数据库连接
@@ -181,6 +71,7 @@ def shutdown_cleanup():
 # 注册蓝图
 app.register_blueprint(auth_bp)
 app.register_blueprint(projects_bp)
+app.register_blueprint(clarify_bp)
 
 # 主页路由
 @app.route("/")
